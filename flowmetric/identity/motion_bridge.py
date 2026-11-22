@@ -56,6 +56,7 @@ class _Track:
     frames: np.ndarray
     feet: np.ndarray
     heights: np.ndarray
+    times: np.ndarray
 
     @property
     def first_frame(self) -> int:
@@ -81,6 +82,11 @@ def _tracks(local_pass: LocalPass) -> list[_Track]:
     for tracklet_id, items in observations.items():
         items.sort(key=lambda item: item[0])
         frames = np.asarray([item[0] for item in items], dtype=int)
+        times = (
+            np.asarray(local_pass.frame_times, dtype=float)[frames]
+            if len(local_pass.frame_times) == local_pass.total
+            else frames.astype(float) / local_pass.fps
+        )
         boxes = np.stack([item[1] for item in items])
         result.append(
             _Track(
@@ -88,24 +94,30 @@ def _tracks(local_pass: LocalPass) -> list[_Track]:
                 frames=frames,
                 feet=np.c_[(boxes[:, 0] + boxes[:, 2]) / 2, boxes[:, 3]],
                 heights=np.maximum(boxes[:, 3] - boxes[:, 1], 1.0),
+                times=times,
             )
         )
     return result
 
 
-def _velocity(track: _Track, fps: float, *, at_end: bool) -> np.ndarray:
+def _velocity(track: _Track, *, at_end: bool) -> np.ndarray:
     """Median endpoint velocity in pixels/second, resistant to box jitter."""
-    if len(track.frames) < 2:
+    if len(track.times) < 2:
         return np.zeros(2, dtype=float)
-    subset = slice(max(0, len(track.frames) - 6), None) if at_end else slice(0, 6)
-    frames = track.frames[subset]
+
+    subset = slice(max(0, len(track.times) - 6), None) if at_end else slice(0, 6)
+    times = track.times[subset]
     feet = track.feet[subset]
-    deltas = np.diff(frames).astype(float)
+
+    deltas = np.diff(times)
     valid = deltas > 0
     if not np.any(valid):
         return np.zeros(2, dtype=float)
-    return np.median(np.diff(feet, axis=0)[valid] / deltas[valid, None] * fps, axis=0)
 
+    return np.median(
+        np.diff(feet, axis=0)[valid] / deltas[valid, None],
+        axis=0,
+    )
 
 def _bounded_velocity(velocity: np.ndarray, height: float, gap_s: float) -> np.ndarray:
     # A noisy endpoint must not extrapolate by more than two body heights.
@@ -176,10 +188,9 @@ def propose_motion_bridges(
                 continue
             if tuple(sorted((earlier.tracklet_id, later.tracklet_id))) in blocked_pairs:
                 continue
-            gap_frames = later.first_frame - earlier.last_frame
-            if gap_frames <= 0:
+            gap_s = float(later.times[0] - earlier.times[-1])
+            if gap_s <= 0:
                 continue
-            gap_s = gap_frames / local_pass.fps
             if gap_s > max_gap_s:
                 continue
             earlier_height = float(np.median(earlier.heights[-min(5, len(earlier.heights)) :]))
@@ -191,10 +202,10 @@ def propose_motion_bridges(
                 continue
             scale = max((earlier_height + later_height) / 2, 1.0)
             forward_velocity = _bounded_velocity(
-                _velocity(earlier, local_pass.fps, at_end=True), earlier_height, gap_s
+                _velocity(earlier, at_end=True), earlier_height, gap_s
             )
             backward_velocity = _bounded_velocity(
-                _velocity(later, local_pass.fps, at_end=False), later_height, gap_s
+                _velocity(later, at_end=False), later_height, gap_s
             )
             forward = float(
                 np.linalg.norm(earlier.feet[-1] + forward_velocity * gap_s - later.feet[0])

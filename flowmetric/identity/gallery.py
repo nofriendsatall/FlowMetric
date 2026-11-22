@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
+from collections.abc import Iterable
 
 import cv2
 import numpy as np
@@ -93,6 +94,7 @@ def validate_tracklet_reid_response(
 
     seen_identity_ids: set[int] = set()
     assigned: set[int] = set()
+    assigned_identity_by_tracklet: dict[int, int] = {}
     for index, identity in enumerate(identities):
         if not isinstance(identity, dict) or set(identity) != {
             "id",
@@ -119,12 +121,21 @@ def validate_tracklet_reid_response(
                 or not isinstance(tracklet_id, int)
                 or tracklet_id not in expected
             ):
+                expected_sorted = sorted(expected)
                 raise AstraResponseError(
-                    f"identity {identity_id} returned unknown tracklet id {tracklet_id!r}"
+                    f"identity {identity_id} returned unknown tracklet id {tracklet_id!r}; "
+                    f"expected_count={len(expected_sorted)}, "
+                    f"expected_head={expected_sorted[:15]}, "
+                    f"expected_tail={expected_sorted[-15:]}"
                 )
             if tracklet_id in assigned:
-                raise AstraResponseError(f"tracklet id {tracklet_id} was assigned more than once")
+                previous_identity = assigned_identity_by_tracklet[tracklet_id]
+                raise AstraResponseError(
+                    f"tracklet id {tracklet_id} was assigned more than once: "
+                    f"identity {previous_identity} and identity {identity_id}"
+                )
             assigned.add(tracklet_id)
+            assigned_identity_by_tracklet[tracklet_id] = identity_id
 
     for tracklet_id in abstained:
         if (
@@ -488,9 +499,8 @@ def _render_cell(
     return canvas
 
 
-def build_tracklet_gallery(
-    sample_frames: Sequence[np.ndarray],
-    video_frames: Sequence[int],
+def build_tracklet_gallery_from_iterable(
+    frame_items: Iterable[tuple[int, np.ndarray, int]],
     detections: Mapping[int, Sequence[tuple[int, np.ndarray, float]]],
     *,
     crops_per_tracklet: int = 3,
@@ -498,15 +508,17 @@ def build_tracklet_gallery(
     cell_height: int = 240,
     columns: int = 6,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Build one labelled contact sheet from local boxes only."""
-    if len(sample_frames) != len(video_frames) or not sample_frames:
-        raise ValueError("sample_frames and video_frames must be aligned and non-empty")
+    """Build a gallery from an iterable of (sample index, frame, video index)."""
     if crops_per_tracklet < 1 or columns < 1 or cell_width < 64 or cell_height < 96:
         raise ValueError("invalid tracklet gallery layout")
+
     observations: dict[
         int, list[tuple[int, int, np.ndarray, float, np.ndarray, float]]
     ] = defaultdict(list)
-    for sample_index, (frame, video_frame) in enumerate(zip(sample_frames, video_frames)):
+    frame_count = 0
+
+    for sample_index, frame, video_frame in frame_items:
+        frame_count += 1
         if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.size == 0:
             raise ValueError("gallery frames must be non-empty colour images")
         frame_detections = list(detections.get(video_frame, ()))
@@ -532,6 +544,9 @@ def build_tracklet_gallery(
                     quality,
                 )
             )
+
+    if frame_count == 0:
+        raise ValueError("sample_frames and video_frames must be aligned and non-empty")
     if not observations:
         raise ValueError("cannot build a tracklet gallery without local detections")
 
@@ -568,6 +583,35 @@ def build_tracklet_gallery(
         y, x = row * cell_height, column * cell_width
         gallery[y : y + cell_height, x : x + cell_width] = cell
     return gallery, metadata
+
+
+def build_tracklet_gallery(
+    sample_frames: Sequence[np.ndarray],
+    video_frames: Sequence[int],
+    detections: Mapping[int, Sequence[tuple[int, np.ndarray, float]]],
+    *,
+    crops_per_tracklet: int = 3,
+    cell_width: int = 176,
+    cell_height: int = 240,
+    columns: int = 6,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Build one labelled contact sheet from local boxes only."""
+    if len(sample_frames) != len(video_frames) or not sample_frames:
+        raise ValueError("sample_frames and video_frames must be aligned and non-empty")
+
+    return build_tracklet_gallery_from_iterable(
+        (
+            (sample_index, frame, video_frame)
+            for sample_index, (frame, video_frame) in enumerate(
+                zip(sample_frames, video_frames)
+            )
+        ),
+        detections,
+        crops_per_tracklet=crops_per_tracklet,
+        cell_width=cell_width,
+        cell_height=cell_height,
+        columns=columns,
+    )
 
 
 def astra_reid_tracklet_gallery(

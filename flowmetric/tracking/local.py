@@ -10,7 +10,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from flowmetric.paths import weights_path
-
+import av
 
 def apply_tracker_appearance_bonus(
     motion_distances: np.ndarray,
@@ -57,6 +57,7 @@ class LocalPass:
     _pair_constraints: tuple[set[tuple[int, int]], set[tuple[int, int]]] | None = field(
         default=None, repr=False
     )
+    frame_times: list[float] = field(default_factory=list)
 
 
 def local_track(
@@ -74,8 +75,9 @@ def local_track(
     part_aware_appearance: bool = False,
     ensemble_appearance: bool = False,
     tracker_reid_model: Path | None = None,
+    retain_sample_frames: bool = True,
 ) -> LocalPass:
-    """Run the local detector/tracker and retain optional ReID sample frames."""
+    """Run local detection/tracking and optionally retain sampled image arrays."""
     model = YOLO(weights_path(model_name))
     appearance_encoder = None
     if appearance_model is not None or tracker_reid_model is not None:
@@ -120,27 +122,57 @@ def local_track(
             )
 
         bot_sort.BOTSORT.get_dists = get_dists
-    capture = cv2.VideoCapture(str(source))
-    if not capture.isOpened():
-        raise RuntimeError(f"Cannot open {source}")
+    container = av.open(str(source))
+    if not container.streams.video:
+        container.close()
+        raise RuntimeError(f"No video stream in {source}")
 
-    fps = capture.get(cv2.CAP_PROP_FPS) or 24.0
+    stream = container.streams.video[0]
+    fps = float(stream.average_rate) if stream.average_rate else 24.0
+    width = int(stream.codec_context.width)
+    height = int(stream.codec_context.height)
+
+    if width <= 0 or height <= 0:
+        container.close()
+        raise RuntimeError(f"Cannot read video dimensions from {source}")
+
     local_pass = LocalPass(
         fps=fps,
-        width=int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        height=int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        total=int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
+        width=width,
+        height=height,
+        total=0,
     )
-    step = max(1, int(round(fps / sample_fps))) if sample_fps > 0 else 0
 
+    sample_interval = 1.0 / sample_fps if sample_fps > 0 else 0.0
+    if sample_fps < 0:
+        container.close()
+        raise ValueError("sample_fps must be >= 0")
     frame_index = 0
-    last_appearance_frame: dict[int, int] = {}
-    appearance_interval = max(1, int(round(fps * appearance_interval_s)))
+    first_pts = None
+    last_sample_time = None
+    last_appearance_time: dict[int, float] = {}
     try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
+        for decoded_frame in container.decode(stream):
+            frame = decoded_frame.to_ndarray(format="bgr24")
+
+            if decoded_frame.pts is not None and stream.time_base is not None:
+                raw_time = float(decoded_frame.pts * stream.time_base)
+                if first_pts is None:
+                    first_pts = raw_time
+                now = raw_time - first_pts
+            else:
+                now = (
+                    local_pass.frame_times[-1] + 1.0 / fps
+                    if local_pass.frame_times
+                    else 0.0
+                )
+
+            if local_pass.frame_times and now <= local_pass.frame_times[-1]:
+                raise RuntimeError(
+                    f"Non-increasing video timestamp at frame {frame_index}: {now}"
+                )
+
+            local_pass.frame_times.append(now)
             result = model.track(
                 frame,
                 persist=True,
@@ -168,10 +200,9 @@ def local_track(
                 selected = [
                     detection
                     for detection in detections
-                    if frame_index - last_appearance_frame.get(
-                        detection[0], -appearance_interval
-                    )
-                    >= appearance_interval
+                    if now - last_appearance_time.get(
+                        detection[0], float("-inf")
+                    ) >= appearance_interval_s
                 ]
                 if selected:
                     selected_boxes = np.stack(
@@ -246,16 +277,20 @@ def local_track(
                             ).append(
                                 (frame_index, secondary_embedding, secondary_quality)
                             )
-                        last_appearance_frame[track_id] = frame_index
-
-            if step and frame_index % step == 0:
+                        last_appearance_time[track_id] = now
+            if sample_interval and (
+                last_sample_time is None
+                or now - last_sample_time >= sample_interval
+            ):
                 local_pass.sample_idx.append(frame_index)
-                local_pass.sample_frames.append(frame.copy())
+                if retain_sample_frames:
+                    local_pass.sample_frames.append(frame.copy())
+                last_sample_time = now
             frame_index += 1
             if frame_index % 50 == 0:
                 print(f"  local: {frame_index}/{local_pass.total} frames")
     finally:
-        capture.release()
+        container.close()
         if original_build_encoder is not None:
             from ultralytics.trackers import bot_sort
 

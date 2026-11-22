@@ -1,7 +1,7 @@
 """Provider-neutral helpers for validated trajectories and video crops."""
 
 from __future__ import annotations
-
+import av
 import math
 from collections.abc import Sequence
 from pathlib import Path
@@ -112,8 +112,75 @@ def service_crop_bounds(
     return left, top, right, bottom
 
 
+class VideoFrameReader:
+    """Read requested video frames sequentially without retaining old frames."""
+
+    def __init__(self, source: Path) -> None:
+        self.source = source
+        self.container = None
+        self._iterator = None
+        self.next_index = 0
+
+    def __enter__(self) -> "VideoFrameReader":
+        try:
+            self.container = av.open(str(self.source))
+            stream = next(
+                (item for item in self.container.streams if item.type == "video"),
+                None,
+            )
+            if stream is None:
+                raise RuntimeError(f"source has no video stream: {self.source}")
+            self._iterator = iter(self.container.decode(stream))
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.container is not None:
+            self.container.close()
+            self.container = None
+        self._iterator = None
+
+    def read_many(self, frame_indexes: Sequence[int]) -> dict[int, np.ndarray]:
+        requested = tuple(sorted(set(frame_indexes)))
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in requested
+        ):
+            raise ValueError("frame indexes must be non-negative integers")
+        if requested and requested[0] < self.next_index:
+            raise ValueError("requested frame index has already been passed")
+        if not requested:
+            return {}
+        if self._iterator is None:
+            raise RuntimeError("VideoFrameReader must be used inside a with block")
+
+        frames: dict[int, np.ndarray] = {}
+        try:
+            for target in requested:
+                while self.next_index <= target:
+                    decoded_frame = next(self._iterator)
+                    index = self.next_index
+                    self.next_index += 1
+                    if index == target:
+                        frames[index] = decoded_frame.to_ndarray(format="bgr24")
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"cannot decode source video frames: "
+                f"{[index for index in requested if index not in frames]}"
+            ) from exc
+        except (av.error.FFmpegError, OSError) as exc:
+            raise RuntimeError(f"cannot decode source video: {self.source}") from exc
+
+        return frames
+
+
 def load_video_frames(source: Path, frame_indexes: tuple[int, ...]) -> dict[int, np.ndarray]:
-    """Decode requested source frames once through a single capture handle."""
+    """Decode requested source frames sequentially through a single PyAV container."""
     requested = tuple(sorted(set(frame_indexes)))
     if any(
         isinstance(index, bool) or not isinstance(index, int) or index < 0
@@ -122,21 +189,34 @@ def load_video_frames(source: Path, frame_indexes: tuple[int, ...]) -> dict[int,
         raise ValueError("frame indexes must be non-negative integers")
     if not requested:
         return {}
-    capture = cv2.VideoCapture(str(source))
-    if not capture.isOpened():
-        capture.release()
-        raise RuntimeError(f"cannot open source video: {source}")
+
     frames: dict[int, np.ndarray] = {}
     try:
-        next_position = 0
-        for index in requested:
-            if next_position != index and not capture.set(cv2.CAP_PROP_POS_FRAMES, index):
-                raise RuntimeError(f"cannot seek source video to frame {index}")
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                raise RuntimeError(f"cannot decode source video frame {index}")
-            frames[index] = frame
-            next_position = index + 1
-    finally:
-        capture.release()
+        with av.open(str(source)) as container:
+            stream = next(
+                (item for item in container.streams if item.type == "video"),
+                None,
+            )
+            if stream is None:
+                raise RuntimeError(f"source has no video stream: {source}")
+
+            requested_set = set(requested)
+            last_requested = requested[-1]
+
+            for index, decoded_frame in enumerate(container.decode(stream)):
+                if index in requested_set:
+                    frames[index] = decoded_frame.to_ndarray(format="bgr24")
+
+                if index >= last_requested:
+                    break
+
+    except (av.error.FFmpegError, OSError) as exc:
+        raise RuntimeError(f"cannot decode source video: {source}") from exc
+
+    missing = requested_set - frames.keys()
+    if missing:
+        raise RuntimeError(
+            f"cannot decode source video frames: {sorted(missing)}"
+        )
+
     return frames

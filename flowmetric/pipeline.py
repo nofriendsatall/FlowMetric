@@ -22,7 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 
 from flowmetric.config import IdentityConfig, PipelineConfig, ServiceConfig, TrackingConfig
@@ -131,6 +130,7 @@ def astra_pass(
     from flowmetric.identity.gallery import (
         astra_reid_tracklet_gallery,
         build_tracklet_gallery,
+        build_tracklet_gallery_from_iterable,
         normalize_gallery_response,
         targeted_gallery_inventory,
         build_targeted_candidate_shortlists,
@@ -138,16 +138,27 @@ def astra_pass(
 
     client, default_model = make_client()
     model = model or default_model
-    batches = make_batches(len(lp.sample_frames), batch_size, overlap=batch_overlap)
+    batches = make_batches(len(lp.sample_idx), batch_size, overlap=batch_overlap)
     expected_batches = [[lp.sample_idx[i] for i in batch] for batch in batches]
+    all_local_tracklet_ids = {
+        int(tid)
+        for frame_detections in lp.dets.values()
+        for tid, _, _ in frame_detections
+    }
     print(
-        f"  astra: {len(lp.sample_frames)} sampled frames → {len(batches)} call(s) "
+        f"  astra: {len(lp.sample_idx)} sampled frames → {len(batches)} call(s) "
         f"to {model} @ {client.base_url}"
     )
 
-    def run(b: list[int]) -> dict[str, Any]:
-        frames = [lp.sample_frames[i] for i in b]
+    def run(
+        b: list[int],
+        frame_map: dict[int, np.ndarray] | None = None,
+    ) -> dict[str, Any]:
         video_frames = [lp.sample_idx[i] for i in b]
+        if frame_map is None:
+            frames = [lp.sample_frames[i] for i in b]
+        else:
+            frames = [frame_map[frame] for frame in video_frames]
         if not any(lp.dets.get(frame) for frame in video_frames):
             return normalize_gallery_response(
                 {"identities": [], "abstained_tracklet_ids": []},
@@ -164,6 +175,7 @@ def astra_pass(
             video_frames,
             lp.dets,
         )
+        astra_batch_fallback = False
         for attempt in range(2):
             try:
                 response, actual_model = astra_reid_tracklet_gallery(
@@ -174,10 +186,44 @@ def astra_pass(
                     client=client,
                 )
                 break
-            except AstraResponseError:
+            except AstraResponseError as exc:
                 if attempt == 1:
-                    raise
-        return normalize_gallery_response(
+                    message = str(exc)
+                    markers = ("unknown tracklet id ", "tracklet id ")
+                    offending_id = None
+                    for marker in markers:
+                        if marker in message:
+                            token = message.split(marker, 1)[1].split()[0].rstrip(",;")
+                            try:
+                                offending_id = int(token)
+                            except ValueError:
+                                pass
+                            break
+                    print(
+                        "  Astra diagnostic:"
+                        f" batch_frames={video_frames[0]}..{video_frames[-1]},"
+                        f" batch_tracklets={len(tracklets)},"
+                        f" offending_id={offending_id},"
+                        f" id_exists_globally="
+                        f"{offending_id in all_local_tracklet_ids if offending_id is not None else 'unknown'}",
+                        flush=True,
+                    )
+                    fallback_ids = sorted(
+                        int(item["tracklet_id"]) for item in tracklets
+                    )
+                    response = {
+                        "identities": [],
+                        "abstained_tracklet_ids": fallback_ids,
+                    }
+                    actual_model = None
+                    astra_batch_fallback = True
+                    print(
+                        "  Astra batch fallback:"
+                        f" frames={video_frames[0]}..{video_frames[-1]},"
+                        f" abstained_tracklets={len(fallback_ids)}",
+                        flush=True,
+                    )
+        result = normalize_gallery_response(
             response,
             tracklets=tracklets,
             video_frames=video_frames,
@@ -187,9 +233,57 @@ def astra_pass(
             requested_model=model,
             actual_model=actual_model,
         )
+        if astra_batch_fallback:
+            result["_meta"]["astra_batch_fallback"] = True
+            result["_meta"]["fallback_abstained_tracklet_ids"] = fallback_ids
+        return result
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        reids = list(pool.map(run, batches))
+    worker_count = max(1, workers)
+    if lp.sample_frames:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            reids = list(pool.map(run, batches))
+    else:
+        if batches and source is None:
+            raise ValueError("source is required to decode Astra sample frames")
+        from flowmetric.media.video import VideoFrameReader
+
+        reids = []
+        carry: dict[int, np.ndarray] = {}
+        with VideoFrameReader(source) as reader:
+            for start in range(0, len(batches), worker_count):
+                group = batches[start : start + worker_count]
+                needed = {
+                    lp.sample_idx[position]
+                    for batch in group
+                    for position in batch
+                }
+                next_group = batches[start + worker_count : start + 2 * worker_count]
+                next_needed = {
+                    lp.sample_idx[position]
+                    for batch in next_group
+                    for position in batch
+                }
+                frame_map = {
+                    frame: image for frame, image in carry.items()
+                    if frame in needed
+                }
+                missing = sorted(needed - frame_map.keys())
+                if missing:
+                    frame_map.update(reader.read_many(tuple(missing)))
+                with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                    group_results = list(
+                        pool.map(
+                            lambda batch: run(batch, frame_map),
+                            group,
+                        )
+                    )
+                reids.extend(group_results)
+                carry = {
+                    frame: frame_map[frame]
+                    for frame in next_needed
+                    if frame in frame_map
+                }
+
     validate_reid_batches(
         reids,
         expected_batches=expected_batches,
@@ -241,7 +335,6 @@ def astra_pass(
                 if source is None:
                     raise ValueError("source is required for targeted resampling")
                 from flowmetric.identity.sampling import select_targeted_resample_frames
-                from flowmetric.media.video import load_video_frames
 
                 resampled_frames = select_targeted_resample_frames(
                     lp,
@@ -250,13 +343,21 @@ def astra_pass(
                     additional_count=targeted_resample_budget,
                 )
                 if resampled_frames:
-                    decoded = load_video_frames(source, tuple(resampled_frames))
-                    frames_by_index = dict(zip(lp.sample_idx, lp.sample_frames))
-                    frames_by_index.update(decoded)
-                    targeted_frame_indexes = sorted(frames_by_index)
-                    targeted_frames = [
-                        frames_by_index[index] for index in targeted_frame_indexes
-                    ]
+                    if lp.sample_frames:
+                        from flowmetric.media.video import load_video_frames
+
+                        decoded = load_video_frames(source, tuple(resampled_frames))
+                        frames_by_index = dict(zip(lp.sample_idx, lp.sample_frames))
+                        frames_by_index.update(decoded)
+                        targeted_frame_indexes = sorted(frames_by_index)
+                        targeted_frames = [
+                            frames_by_index[index] for index in targeted_frame_indexes
+                        ]
+                    else:
+                        targeted_frame_indexes = sorted(
+                            set(lp.sample_idx) | set(resampled_frames)
+                        )
+
             selected_ids = set(query_ids) | set(reference_ids)
             targeted_detections = {
                 frame: [
@@ -266,13 +367,30 @@ def astra_pass(
                 ]
                 for frame in targeted_frame_indexes
             }
-            gallery, tracklets = build_tracklet_gallery(
-                targeted_frames,
-                targeted_frame_indexes,
-                targeted_detections,
-            )
-            response: dict[str, Any]
-            actual_model: str | None
+            if lp.sample_frames:
+                gallery, tracklets = build_tracklet_gallery(
+                    targeted_frames,
+                    targeted_frame_indexes,
+                    targeted_detections,
+                )
+            else:
+                if source is None:
+                    raise ValueError("source is required to decode targeted gallery frames")
+                from flowmetric.media.video import VideoFrameReader
+
+                def targeted_frame_items():
+                    with VideoFrameReader(source) as reader:
+                        for sample_index, frame_index in enumerate(targeted_frame_indexes):
+                            frame = reader.read_many((frame_index,))[frame_index]
+                            yield sample_index, frame, frame_index
+
+                gallery, tracklets = build_tracklet_gallery_from_iterable(
+                    targeted_frame_items(),
+                    targeted_detections,
+                )
+            response: dict[str, Any] | None = None
+            actual_model: str | None = None
+            targeted_failed = False
             for attempt in range(2):
                 try:
                     response, actual_model = astra_reid_tracklet_gallery(
@@ -288,9 +406,18 @@ def astra_pass(
                         repair_shortlist_violations=attempt == 1,
                     )
                     break
-                except AstraResponseError:
+                except AstraResponseError as exc:
                     if attempt == 1:
-                        raise
+                        targeted_failed = True
+                        print(
+                            "  Astra targeted skipped after two invalid responses: "
+                            f"{exc}",
+                            flush=True,
+                        )
+            if targeted_failed:
+                return reids
+            if response is None:
+                raise RuntimeError("targeted Astra pass ended without a response")
             targeted_reid = normalize_gallery_response(
                 response,
                 tracklets=tracklets,
@@ -593,12 +720,21 @@ def run_hybrid(
         ):
             raise ValueError("local_service_imgsz must be a positive integer")
 
-    probe = cv2.VideoCapture(str(source))
-    if not probe.isOpened():
-        raise RuntimeError(f"Cannot open {source}")
-    source_width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-    source_height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    probe.release()
+    import av
+
+    try:
+        with av.open(str(source)) as container:
+            stream = next(
+                (item for item in container.streams if item.type == "video"),
+                None,
+            )
+        if stream is None:
+            raise RuntimeError(f"Cannot open video stream: {source}")
+        source_width = int(stream.codec_context.width)
+        source_height = int(stream.codec_context.height)
+    except (av.error.FFmpegError, OSError) as exc:
+        raise RuntimeError(f"Cannot open {source}") from exc
+
     if source_width <= 0 or source_height <= 0:
         raise RuntimeError(f"Cannot read video dimensions from {source}")
     scene = load_scene_config(
@@ -632,6 +768,7 @@ def run_hybrid(
         tracker_reid_model=(
             reid_appearance_model if reid_in_tracker else None
         ),
+        retain_sample_frames=not use_astra,
     )
     appearance_stats: dict[str, Any] = {}
     appearance_min_similarity = 0.82
@@ -690,13 +827,17 @@ def run_hybrid(
         appearance_source = "local_sinet_stitch"
     if use_astra and reid_adaptive_sampling:
         from flowmetric.identity.sampling import select_adaptive_reid_frames
-        from flowmetric.media.video import load_video_frames
 
         sample_count = max(1, len(lp.sample_idx))
         adaptive_indexes = select_adaptive_reid_frames(lp, count=sample_count)
-        adaptive_frames = load_video_frames(source, tuple(adaptive_indexes))
+        if lp.sample_frames:
+            from flowmetric.media.video import load_video_frames
+
+            adaptive_frames = load_video_frames(source, tuple(adaptive_indexes))
+            lp.sample_frames = [
+                adaptive_frames[index] for index in adaptive_indexes
+            ]
         lp.sample_idx = adaptive_indexes
-        lp.sample_frames = [adaptive_frames[index] for index in adaptive_indexes]
         print(
             f"      adaptive ReID sampling: {sample_count} frames, "
             f"{len({tid for frame in adaptive_indexes for tid, _, _ in lp.dets[frame]})} tracklets covered"
@@ -719,7 +860,7 @@ def run_hybrid(
         )
 
         batch_positions = make_batches(
-            len(lp.sample_frames), batch_size, overlap=batch_overlap
+            len(lp.sample_idx), batch_size, overlap=batch_overlap
         )
         expected_batches = [
             [lp.sample_idx[i] for i in batch] for batch in batch_positions
@@ -1425,69 +1566,6 @@ def main() -> None:
     if not args.no_astra and not has_api_key():
         if not cache_ready:
             raise SystemExit("Set VSELLM_API_KEY (or OPENAI_API_KEY), or pass --no-astra")
-        if args.no_reid_adaptive_sampling:
-            # Reject an obviously stale/legacy uniform-sampling cache before
-            # the expensive local pass. Detection-aware indexes are only known
-            # after tracking and are validated later in run_hybrid.
-            from flowmetric.infrastructure.astra import (
-                AstraCacheError,
-                build_astra_cache_manifest,
-                load_astra_cache,
-            )
-
-            probe = cv2.VideoCapture(str(args.source))
-            if not probe.isOpened():
-                raise SystemExit(f"Cannot open {args.source}")
-            fps = probe.get(cv2.CAP_PROP_FPS) or 24.0
-            width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
-            probe.release()
-            step = max(1, int(round(fps / args.sample_fps)))
-            sample_indexes = list(range(0, total, step))
-            batch_positions = make_batches(
-                len(sample_indexes), args.batch_size, overlap=args.batch_overlap
-            )
-            expected_batches = [
-                [sample_indexes[i] for i in batch] for batch in batch_positions
-            ]
-            expected_manifest = build_astra_cache_manifest(
-                args.source,
-                fps=fps,
-                width=width,
-                height=height,
-                frame_count=total,
-                sample_frame_indexes=sample_indexes,
-                sample_fps=args.sample_fps,
-                batch_size=args.batch_size,
-                batch_overlap=args.batch_overlap,
-                targeted_pass=not args.no_reid_targeted_pass,
-                targeted_references_per_identity=args.reid_targeted_references,
-                targeted_resampling=args.reid_targeted_resampling,
-                targeted_resample_budget=args.reid_targeted_resample_frames,
-                targeted_shortlist=args.reid_targeted_shortlist,
-                targeted_shortlist_size=args.reid_targeted_shortlist_size,
-                part_aware_appearance=args.reid_part_aware_appearance,
-                tracker_reid=args.reid_in_tracker,
-                offline_graph=(
-                    args.reid_offline_graph or args.reid_scenario_constraints
-                ),
-                requested_model=args.astra_model,
-                effort=args.astra_effort,
-            )
-            try:
-                load_astra_cache(
-                    args.astra_cache,
-                    expected_manifest=expected_manifest,
-                    expected_batches=expected_batches,
-                    original_width=width,
-                    original_height=height,
-                )
-            except (AstraCacheError, OSError, ValueError) as exc:
-                raise SystemExit(
-                    f"Cannot reuse Astra cache {args.astra_cache}: {exc}. "
-                    "Set VSELLM_API_KEY/OPENAI_API_KEY to refresh it or use --no-astra."
-                ) from exc
 
     stats = run_pipeline(
         PipelineConfig(

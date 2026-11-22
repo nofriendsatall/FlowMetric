@@ -90,10 +90,11 @@ def _finish_service_interval(
     staff: str,
     state: _ServiceState,
     end_frame: int,
-    fps: float,
+    times: np.ndarray,
+    frame_times: np.ndarray | None = None,
     *,
     right_censored: bool,
-) -> ServiceInterval | None:
+) -> list[ServiceInterval]:
     """Validate an FSM episode and turn it into a stable public interval."""
     if state.customer is None or state.interaction_start is None:
         return None
@@ -110,7 +111,7 @@ def _finish_service_interval(
     if not samples:
         return None
     sample_frames = np.asarray([s[0] for s in samples], dtype=int)
-    duration = (end_frame - state.interaction_start) / fps
+    duration = float(times[end_frame] - times[state.interaction_start])
     expected = end_frame - state.interaction_start + 1
     coverage = len(np.unique(sample_frames)) / max(expected, 1)
     if (
@@ -129,8 +130,11 @@ def _finish_service_interval(
     if stationary_ratio < SERVICE_STATIONARY_RATIO:
         return None
 
-    first_window = state.interaction_start + max(1, int(SERVICE_GAP_S * fps))
-    first_distances = [d for f, d, _ in samples if f <= first_window]
+    first_window_time = times[state.interaction_start] + SERVICE_GAP_S
+    first_distances = [
+        d for f, d, _ in samples
+        if times[f] <= first_window_time
+    ]
     approach_drop = state.approach_baseline - float(np.median(first_distances))
     if not state.left_censored and approach_drop < SERVICE_APPROACH_MIN_DELTA:
         return None
@@ -167,6 +171,7 @@ def extract_service_intervals(
     tables: list[list[float]],
     n_frames: int,
     fps: float,
+    frame_times: np.ndarray | None = None,
 ) -> list[ServiceInterval]:
     """Infer service with an explicit approach → interaction → departure FSM.
 
@@ -175,17 +180,37 @@ def extract_service_intervals(
     until it has left the expanded zone, preventing near-zone jitter from
     producing duplicate end/start pairs.
     """
+    if (
+        isinstance(n_frames, bool)
+        or not isinstance(n_frames, (int, np.integer))
+        or n_frames <= 0
+    ):
+        raise ValueError("n_frames must be a positive integer")
+
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError("fps must be finite and positive")
+
+    times = (
+        np.asarray(frame_times, dtype=float)
+        if frame_times is not None
+        else np.arange(n_frames, dtype=float) / fps
+    )
+    if (
+        times.ndim != 1
+        or len(times) != n_frames
+        or not np.all(np.isfinite(times))
+        or np.any(np.diff(times) <= 0)
+    ):
+        raise ValueError(
+            "frame_times must be finite, strictly increasing, "
+            "and match n_frames"
+        )
+
     if not staff_tracks or not customers:
         return []
 
     # Compare elapsed frame time directly.  Rounding a duration to a frame
     # count can relax maximum gaps or shorten minimum holds at low frame rates.
-    gap_frames = SERVICE_GAP_S * fps
-    approach_frames = SERVICE_APPROACH_WINDOW_S * fps
-    acquire_frames = SERVICE_ACQUIRE_S * fps
-    departure_frames = SERVICE_DEPARTURE_S * fps
-    merge_frames = SERVICE_MERGE_GAP_S * fps
-    cooldown_frames = SERVICE_COOLDOWN_S * fps
 
     staff_index = {
         tr.gid: {int(frame): i for i, frame in enumerate(tr.frames.tolist())}
@@ -233,7 +258,7 @@ def extract_service_intervals(
 
     def start_acquire(state: _ServiceState, frame: int, obs: _ServiceObservation) -> None:
         if state.acquire_start is None or (
-            state.acquire_last is not None and frame - state.acquire_last > gap_frames
+            state.acquire_last is not None and times[frame] - times[state.acquire_last] > SERVICE_GAP_S
         ):
             state.acquire_start = frame
             state.interaction_frames = state.interaction_frames or []
@@ -261,7 +286,7 @@ def extract_service_intervals(
             state.clear()
             return
         interval = _finish_service_interval(
-            staff_id, state, end_frame, fps, right_censored=False
+            staff_id, state, end_frame, times, right_censored=False
         )
         if interval is not None:
             intervals.append(interval)
@@ -287,7 +312,7 @@ def extract_service_intervals(
                 key = (staff_id, customer_id)
                 recent = history.setdefault(key, deque())
                 recent.append((frame, obs.distance, obs.speed))
-                while recent and frame - recent[0][0] > approach_frames:
+                while recent and times[frame] - times[recent[0][0]] > SERVICE_APPROACH_WINDOW_S:
                     recent.popleft()
 
         # Rearm only the completed pair after a real expanded-zone exit.  If
@@ -298,7 +323,7 @@ def extract_service_intervals(
                 blocked_pairs[pair] = frame
                 if not obs.expanded:
                     del blocked_pairs[pair]
-            elif frame - last_seen > cooldown_frames:
+            elif times[frame] - times[last_seen] > SERVICE_COOLDOWN_S:
                 del blocked_pairs[pair]
 
         active_owners = {
@@ -326,7 +351,7 @@ def extract_service_intervals(
                     state.interaction_distances.append(obs.distance)
                     state.interaction_speeds.append(obs.speed)
                     if (
-                        frame <= state.cooldown_until
+                        times[frame] <= state.cooldown_until
                         and obs.acquire
                         and (
                             obs.speed < MOVE_SPEED
@@ -342,17 +367,17 @@ def extract_service_intervals(
                         state.pending_end = None
                         state.cooldown_until = 0.0
                         continue
-                if frame >= state.cooldown_until:
+                if times[frame] >= state.cooldown_until:
                     customer_id = state.customer
                     finish_pending(staff_id, state, frame, obs)
                     active_owners.discard(customer_id)
                 continue
 
             if obs is None:
-                if state.last_observed is not None and frame - state.last_observed > gap_frames:
+                if state.last_observed is not None and times[frame] - times[state.last_observed] > SERVICE_GAP_S:
                     if state.interaction_start is not None:
                         interval = _finish_service_interval(
-                            staff_id, state, state.last_observed, fps, right_censored=True
+                            staff_id, state, state.last_observed, times, right_censored=True
                         )
                         if interval is not None:
                             intervals.append(interval)
@@ -364,7 +389,7 @@ def extract_service_intervals(
             if state.phase == "approaching":
                 if (
                     state.approach_start is not None
-                    and frame - state.approach_start > approach_frames
+                    and times[frame] - times[state.approach_start] > SERVICE_APPROACH_WINDOW_S
                 ):
                     state.clear()
                     continue
@@ -373,7 +398,7 @@ def extract_service_intervals(
                     continue
                 if obs.acquire and obs.speed < STATIONARY_SPEED:
                     start_acquire(state, frame, obs)
-                    if state.acquire_start is not None and frame - state.acquire_start >= acquire_frames:
+                    if state.acquire_start is not None and times[frame] - times[state.acquire_start] >= SERVICE_ACQUIRE_S:
                         approach_drop = state.approach_baseline - obs.distance
                         if (
                             state.left_censored
@@ -417,27 +442,35 @@ def extract_service_intervals(
                 state.outside_start = None
             elif state.outside_start is None:
                 state.outside_start = frame
-            departure_age = frame - (state.departure_start or frame)
+            departure_age = (
+                times[frame] - times[state.departure_start]
+                if state.departure_start is not None
+                else 0.0
+            )
             distance_rise = obs.distance - state.departure_min_distance
             moving_departure = (
-                departure_age >= departure_frames
+                departure_age >= SERVICE_DEPARTURE_S
                 and (distance_rise >= SERVICE_DEPARTURE_MIN_DELTA or not obs.acquire)
             )
             expanded_exit = (
                 state.outside_start is not None
-                and frame - state.outside_start >= departure_frames
+                and times[frame] - times[state.outside_start] >= SERVICE_DEPARTURE_S
             )
             if moving_departure or expanded_exit:
-                end_frame = state.departure_start or frame
+                end_frame = (
+                    state.departure_start
+                    if state.departure_start is not None
+                    else frame
+                )
                 interval = _finish_service_interval(
-                    staff_id, state, end_frame, fps, right_censored=False
+                    staff_id, state, end_frame, times, right_censored=False
                 )
                 if interval is not None:
                     # Keep the endpoint pending for a short grace period.  A
                     # return cancels it and joins both pieces into one episode.
                     state.phase = "ending"
                     state.pending_end = end_frame
-                    state.cooldown_until = end_frame + merge_frames
+                    state.cooldown_until = times[end_frame] + SERVICE_MERGE_GAP_S
                 else:
                     # A rejected tentative interaction must not monopolise the
                     # staff/customer after failing the semantic gates.
@@ -499,13 +532,13 @@ def extract_service_intervals(
             continue
         if state.phase == "ending" and state.pending_end is not None:
             interval = _finish_service_interval(
-                staff_id, state, state.pending_end, fps, right_censored=False
+                staff_id, state, state.pending_end, times, right_censored=False
             )
             if interval is not None:
                 intervals.append(interval)
             continue
         interval = _finish_service_interval(
-            staff_id, state, state.last_observed, fps, right_censored=True
+            staff_id, state, state.last_observed, times, right_censored=True
         )
         if interval is not None:
             intervals.append(interval)

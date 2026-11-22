@@ -134,28 +134,55 @@ def select_local_service_frames(
     if isinstance(max_frames, bool) or not isinstance(max_frames, int) or max_frames < 3:
         raise ValueError("max_frames must be an integer >= 3")
 
-    interval = candidate.interval
-    context = int(round(context_seconds * fps))
-    lower = max(0, interval.start_frame - context)
-    upper = interval.end_frame + context
     n_frames = tracks.get("n_frames")
-    if isinstance(n_frames, int) and not isinstance(n_frames, bool) and n_frames > 0:
-        upper = min(upper, n_frames - 1)
+    raw_times = tracks.get("frame_times")
+
+    if raw_times is not None:
+        times = np.asarray(raw_times, dtype=float)
+        if (
+            not isinstance(n_frames, int)
+            or len(times) != n_frames
+            or not np.all(np.isfinite(times))
+            or np.any(np.diff(times) <= 0)
+        ):
+            raise ValueError("frame_times must be finite, strictly increasing, and match n_frames")
+    else:
+        if not isinstance(n_frames, int) or n_frames <= 0:
+            raise ValueError("n_frames must be a positive integer")
+        times = np.arange(n_frames, dtype=float) / fps
+
+    interval = candidate.interval
+    if (
+        interval.start_frame < 0
+        or interval.end_frame < interval.start_frame
+        or interval.end_frame >= len(times)
+    ):
+        raise ValueError("candidate frame range is outside the video")
+
+    lower_time = times[interval.start_frame] - context_seconds
+    upper_time = times[interval.end_frame] + context_seconds
+    lower = int(np.searchsorted(times, lower_time, side="left"))
+    upper = int(np.searchsorted(times, upper_time, side="right")) - 1
+
     staff = _track_box_map(tracks, interval.staff)
     customer = _track_box_map(tracks, interval.customer)
-    joint = sorted(frame for frame in staff.keys() & customer.keys() if lower <= frame <= upper)
+    joint = sorted(
+        frame
+        for frame in staff.keys() & customer.keys()
+        if lower <= frame <= upper
+    )
     if not joint:
         return ()
 
-    step = max(1, int(round(fps / sample_fps)))
+    sample_period = 1.0 / sample_fps
     sampled = [joint[0]]
     for frame in joint[1:]:
-        if frame - sampled[-1] >= step:
+        if times[frame] - times[sampled[-1]] >= sample_period:
             sampled.append(frame)
     if sampled[-1] != joint[-1]:
         sampled.append(joint[-1])
-    return _sample_evenly(sampled, max_frames)
 
+    return _sample_evenly(sampled, max_frames)
 
 def _weights_path(name: str | Path) -> str:
     path = Path(name)
@@ -444,13 +471,33 @@ def extract_local_service_features(
     object_detections: Mapping[int, Sequence[ObjectDetection]],
     *,
     fps: float,
+    frame_times: np.ndarray | None = None,
     service_objects: frozenset[str] = DEFAULT_SERVICE_OBJECTS,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Aggregate pose, hand, object, lean, and contact-duration evidence."""
     fps = _finite_number(fps, "fps")
     if fps <= 0 or not frames:
         raise ValueError("feature extraction needs positive fps and sampled frames")
-
+    if frame_times is not None:
+        frame_times = np.asarray(frame_times, dtype=float)
+        if (
+            frame_times.ndim != 1
+            or not np.all(np.isfinite(frame_times))
+            or np.any(np.diff(frame_times) <= 0)
+            or any(frame < 0 or frame >= len(frame_times) for frame in frames)
+            or candidate.interval.start_frame < 0
+            or candidate.interval.end_frame >= len(frame_times)
+        ):
+            raise ValueError(
+                "frame_times must cover all referenced frames and be finite "
+                "and strictly increasing"
+            )
+    def frame_time(frame: int) -> float:
+        return (
+            float(frame_times[frame])
+            if frame_times is not None
+            else frame / fps
+        )
     pose_frames = 0
     facing_scores: list[float] = []
     hand_customer: list[bool] = []
@@ -562,33 +609,61 @@ def extract_local_service_features(
 
     sample_count = len(frames)
     pose_denominator = max(pose_frames, 1)
-    nominal_step = max(1.0, float(np.median(np.diff(frames))) if len(frames) > 1 else fps)
-    max_gap = max(1, int(round(1.75 * nominal_step)))
+    sample_times = [frame_time(frame) for frame in frames]
+    nominal_step = (
+        float(np.median(np.diff(sample_times)))
+        if len(sample_times) > 1
+        else 1.0 / fps
+    )
+    max_gap_s = 1.75 * nominal_step
+
     longest_start: int | None = None
     longest_end: int | None = None
     current_start: int | None = None
-    previous_frame: int | None = None
+    previous_time: float | None = None
+
     for frame, active in contact_by_frame:
-        if active and (current_start is None or previous_frame is None or frame - previous_frame <= max_gap):
+        now = frame_time(frame)
+
+        if active and (
+            current_start is None
+            or previous_time is None
+            or now - previous_time <= max_gap_s
+        ):
             current_start = frame if current_start is None else current_start
         elif active:
             current_start = frame
         else:
             current_start = None
+
         if active and current_start is not None:
-            if longest_start is None or frame - current_start > longest_end - longest_start:
+            if (
+                longest_start is None
+                or now - frame_time(current_start)
+                > frame_time(longest_end) - frame_time(longest_start)
+            ):
                 longest_start, longest_end = current_start, frame
-        previous_frame = frame if active else None
+
+        previous_time = now if active else None
+
     contact_duration = (
-        (longest_end - longest_start + nominal_step) / fps
+        frame_time(longest_end) - frame_time(longest_start) + nominal_step
         if longest_start is not None and longest_end is not None
         else 0.0
     )
-    interval_duration = max(
-        (candidate.interval.end_frame - candidate.interval.start_frame + 1) / fps,
-        nominal_step / fps,
-    )
 
+    interval_duration = max(
+        frame_time(candidate.interval.end_frame)
+        - frame_time(candidate.interval.start_frame)
+        + nominal_step,
+        nominal_step,
+    )
+    interval_duration = max(
+        frame_time(candidate.interval.end_frame)
+        - frame_time(candidate.interval.start_frame)
+        + nominal_step,
+        nominal_step,
+    )
     features = {
         "fsm_confidence": _probability(candidate.interval.confidence, "FSM confidence"),
         "pose_coverage": pose_frames / sample_count,
@@ -809,6 +884,11 @@ class LocalServiceVerifier:
                 pose_by_candidate[candidate_index],
                 object_by_candidate[candidate_index],
                 fps=fps,
+                frame_times=(
+                    np.asarray(self.tracks["frame_times"], dtype=float)
+                    if self.tracks.get("frame_times") is not None
+                    else None
+                ),
                 service_objects=self.service_objects,
             )
             details: dict[str, Any] = {

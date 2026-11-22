@@ -75,10 +75,14 @@ def load_tracks(data: dict[str, Any]) -> list[Track]:
             frames=np.asarray(t["frames"], int),
             boxes=np.asarray(t["boxes"], float),
             fps=fps,
+            frame_times=(
+                np.asarray(t["times"], dtype=float)
+                if "times" in t
+                else None
+            ),
         )
         for gid, t in data["tracks"].items()
     ]
-
 
 def in_zone(pt: np.ndarray, poly: list[list[float]] | None) -> bool:
     if not poly:
@@ -209,7 +213,17 @@ def heuristic_role(tr: Track, cam: dict[str, Any], n_frames: int) -> str:
             break
         stationary_tail += 1
     walked = tr.path() >= 1.0 and tr.reach() >= 0.5
-    arrived_and_sat = walked and stationary_tail / tr.fps >= 3.0 and tr.frames[-1] >= n_frames - 2
+    tail_start = len(tr.times) - stationary_tail
+    stationary_duration = (
+        tr.times[-1] - tr.times[tail_start]
+        if stationary_tail > 0
+        else 0.0
+    )
+    arrived_and_sat = (
+        walked
+        and stationary_duration >= 3.0
+        and tr.frames[-1] >= n_frames - 2
+    )
     if arrived_and_sat:
         return "customer"
     return "staff" if walked and moving.mean() >= 0.25 else "customer"
@@ -225,19 +239,36 @@ def _seated_index(tr: Track, v: np.ndarray) -> int | None:
     walking = v > MOVE_SPEED
     if not walking.any():
         return None
-    hold = int(SEATED_MIN_S * tr.fps)
-    win = int(tr.fps)  # compare with the last second: box height changes with perspective
-    c, h = tr.centers, tr.heights
-    for i in range(max(int(np.argmax(walking)), 1), len(c) - hold):
-        if tr.travel(0, i) < 1.0 or h[i] >= 0.85 * h[max(0, i - win) : i].max():
-            continue
-        if np.max(np.linalg.norm(c[i : i + hold] - c[i], axis=1)) < 0.5 * h[i]:
-            return i
-    for a, b in runs(v < STATIONARY_SPEED):
-        if a > 0 and (b - a + 1) / tr.fps >= SEATED_MIN_S and tr.travel(0, a) >= 1.0:
-            return a
-    return None
 
+    times = tr.times
+    hold_s = SEATED_MIN_S
+    c, h = tr.centers, tr.heights
+
+    for i in range(max(int(np.argmax(walking)), 1), len(c)):
+        hold_end = int(np.searchsorted(times, times[i] + hold_s, side="left"))
+        if hold_end >= len(c):
+            break
+
+        previous = times >= times[i] - 1.0
+        previous &= times < times[i]
+        if not np.any(previous):
+            continue
+
+        if tr.travel(0, i) < 1.0 or h[i] >= 0.85 * h[previous].max():
+            continue
+
+        if np.max(np.linalg.norm(c[i : hold_end + 1] - c[i], axis=1)) < 0.5 * h[i]:
+            return i
+
+    for a, b in runs(v < STATIONARY_SPEED):
+        if (
+            a > 0
+            and times[b] - times[a] >= SEATED_MIN_S
+            and tr.travel(0, a) >= 1.0
+        ):
+            return a
+
+    return None
 
 def _reacquired_birth(tr: Track, tracks: list[Track]) -> bool:
     c0, h0 = tr.centers[0], tr.heights[0]
@@ -261,17 +292,21 @@ def _reacquired_death(tr: Track, tracks: list[Track]) -> bool:
 
 def _reliable_exit_tail(tr: Track) -> bool:
     """Whether the track ends with a dense, continuous segment long enough to trust."""
-    max_gap_frames = max(1, int(EXIT_MAX_GAP_S * tr.fps))
-    start = len(tr.frames) - 1
-    while start > 0 and tr.frames[start] - tr.frames[start - 1] <= max_gap_frames:
+    times = tr.times
+    frames = tr.frames
+
+    start = len(times) - 1
+    while start > 0 and times[start] - times[start - 1] <= EXIT_MAX_GAP_S:
         start -= 1
 
-    span_frames = int(tr.frames[-1] - tr.frames[start])
-    if span_frames / tr.fps < MIN_TRACK_S:
+    span_s = float(times[-1] - times[start])
+    if span_s < MIN_TRACK_S:
         return False
-    coverage = (len(tr.frames) - start) / (span_frames + 1)
-    return coverage >= EXIT_MIN_COVERAGE
 
+    span_frames = int(frames[-1] - frames[start])
+    coverage = (len(frames) - start) / (span_frames + 1)
+
+    return coverage >= EXIT_MIN_COVERAGE
 
 def extract_events(
     data: dict[str, Any],
@@ -279,9 +314,34 @@ def extract_events(
     *,
     service_verifier: ServiceVerifier | None = None,
 ) -> dict[str, Any]:
+
     fps = float(data["fps"])
     W, H, n_frames = data["width"], data["height"], data["n_frames"]
-    t_end = (n_frames - 1) / fps
+
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("fps must be finite and positive")
+    if isinstance(n_frames, bool) or not isinstance(n_frames, int) or n_frames <= 0:
+        raise ValueError("n_frames must be a positive integer")
+
+    raw_frame_times = data.get("frame_times")
+    if raw_frame_times is not None:
+        frame_times = np.asarray(raw_frame_times, dtype=float)
+        if (
+            frame_times.ndim != 1
+            or len(frame_times) != n_frames
+            or not np.all(np.isfinite(frame_times))
+            or np.any(np.diff(frame_times) <= 0)
+        ):
+            raise ValueError(
+                "frame_times must be finite, strictly increasing, "
+                "and match n_frames"
+            )
+    else:
+        frame_times = np.arange(n_frames, dtype=float) / fps
+
+    def frame_time(frame: int) -> float:
+        return float(frame_times[frame])
+    t_end = frame_time(n_frames - 1)
     all_tracks = load_tracks(data)
     tracks = [t for t in all_tracks if t.life >= MIN_TRACK_S]
 
@@ -307,7 +367,7 @@ def extract_events(
             if left_door:
                 moving = np.nonzero(v[: left_door[0] + 1] > MOVE_SPEED)[0]
                 i = moving[0] if len(moving) else left_door[0]
-                events.append({"t": round(tr.frames[i] / fps, 3), "type": "enter", "person": tr.gid})
+                events.append({"t": round(frame_time(int(tr.frames[i])), 3), "type": "enter", "person": tr.gid})
 
         # leave_kitchen: staff appears out of the (unseen) kitchen
         if (
@@ -333,7 +393,7 @@ def extract_events(
                 i_seat = None  # came to rest away from any table (standing in the aisle, queueing)
             if i_seat is not None:
                 seat_idx[tr.gid] = i_seat
-                seated_at[tr.gid] = tr.frames[i_seat] / fps
+                seated_at[tr.gid] = frame_time(int(tr.frames[i_seat]))
                 events.append({"t": round(seated_at[tr.gid], 3), "type": "seated", "person": tr.gid})
 
     # service: staff stops next to a seated customer
@@ -371,6 +431,7 @@ def extract_events(
         tables,
         n_frames,
         fps,
+        frame_times=frame_times,
     )
     service_candidates = [
         ServiceCandidate(
@@ -401,7 +462,8 @@ def extract_events(
     }
     services: list[tuple[str, str, float, float]] = []
     for interval in service_intervals:
-        ts, te = interval.start_frame / fps, interval.end_frame / fps
+        ts = frame_time(interval.start_frame)
+        te = frame_time(interval.end_frame)
         services.append((interval.staff, interval.customer, ts, te))
         verification = verification_by_interval.get(interval_key(interval))
         # A left-censored interval is represented only in service_intervals.
@@ -455,8 +517,8 @@ def extract_events(
         metadata: dict[str, Any] = {
             "staff": interval.staff,
             "customer": interval.customer,
-            "start": None if interval.left_censored else round(interval.start_frame / fps, 3),
-            "end": None if interval.right_censored else round(interval.end_frame / fps, 3),
+            "start": None if interval.left_censored else round(frame_time(interval.start_frame), 3),
+            "end": None if interval.right_censored else round(frame_time(interval.end_frame), 3),
             "left_censored": interval.left_censored,
             "right_censored": interval.right_censored,
             "confidence": interval.confidence,
@@ -486,15 +548,15 @@ def extract_events(
                 "start": (
                     None
                     if candidate.interval.left_censored
-                    else round(candidate.interval.start_frame / fps, 3)
+                    else round(frame_time(candidate.interval.start_frame), 3)
                 ),
                 "end": (
                     None
                     if candidate.interval.right_censored
-                    else round(candidate.interval.end_frame / fps, 3)
+                    else round(frame_time(candidate.interval.end_frame), 3)
                 ),
-                "observed_start": round(candidate.interval.start_frame / fps, 3),
-                "observed_end": round(candidate.interval.end_frame / fps, 3),
+                "observed_start": round(frame_time(candidate.interval.start_frame), 3),
+                "observed_end": round(frame_time(candidate.interval.end_frame), 3),
                 "left_censored": candidate.interval.left_censored,
                 "right_censored": candidate.interval.right_censored,
                 "rule_confidence": candidate.interval.confidence,

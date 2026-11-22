@@ -397,6 +397,14 @@ def sync_ids(
     edge_scores: dict[tuple[int, int, int], list[float]] = defaultdict(list)
     edge_sources: dict[tuple[int, int, int], str] = {}
     model_abstentions: set[tuple[int, int]] = set()
+    fallback_abstained_tids = {
+        int(tracklet_id)
+        for reid in reids
+        if reid["_meta"].get("astra_batch_fallback")
+        for tracklet_id in reid["_meta"].get(
+            "fallback_abstained_tracklet_ids", []
+        )
+    }
     roles: dict[tuple[int, int], str] = {}
     matched = total_local = 0
 
@@ -517,6 +525,11 @@ def sync_ids(
             roles.get((batch, identity_id), "unknown")
             for batch, identity_id in uf.astra.get(root, {}).items()
         } - {"unknown"}
+
+    def fallback_protected(root: str) -> bool:
+        return bool(
+            uf.local_ids.get(root, set()) & fallback_abstained_tids
+        )
 
     reranker_training_clusters = {
         int(tracklet_id): uf.find(f"T{tracklet_id}") for tracklet_id in all_tids
@@ -665,6 +678,8 @@ def sync_ids(
                     decision.update(
                         {"decision": "reject", "reason": "both_astra_verified"}
                     )
+                elif fallback_protected(left_root) or fallback_protected(right_root):
+                    decision.update({'decision': 'reject', 'reason': 'astra_batch_fallback_protected'})
                 elif uf.union(left_node, right_node):
                     decision.update({"decision": "merge"})
                     graph_stitched_tids.update((edge.left_id, edge.right_id))
@@ -712,6 +727,8 @@ def sync_ids(
                 and cluster_roles(left_root).isdisjoint(cluster_roles(right_root))
             ):
                 decision.update({"decision": "reject", "reason": "role_conflict"})
+            elif fallback_protected(left_root) or fallback_protected(right_root):
+                decision.update({'decision': 'reject', 'reason': 'astra_batch_fallback_protected'})
             elif uf.union(left_node, right_node):
                 decision.update({"decision": "merge"})
                 appearance_stitched_tids.update(
@@ -756,6 +773,8 @@ def sync_ids(
                     and cluster_roles(left_root).isdisjoint(cluster_roles(right_root))
                 ):
                     decision.update({"decision": "reject", "reason": "role_conflict"})
+                elif fallback_protected(left_root) or fallback_protected(right_root):
+                    decision.update({'decision': 'reject', 'reason': 'astra_batch_fallback_protected'})
                 elif uf.union(left_node, right_node):
                     decision.update({"decision": "merge"})
                     appearance_stitched_tids.update(
@@ -786,6 +805,8 @@ def sync_ids(
                 right_roles = cluster_roles(right_root)
                 if left_roles and right_roles and left_roles.isdisjoint(right_roles):
                     decision.update({"decision": "reject", "reason": "role_conflict"})
+                elif fallback_protected(left_root) or fallback_protected(right_root):
+                    decision.update({'decision': 'reject', 'reason': 'astra_batch_fallback_protected'})
                 elif uf.union(left_node, right_node):
                     decision.update({"decision": "merge"})
                     locally_stitched_tids.update(

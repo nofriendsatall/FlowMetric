@@ -213,6 +213,16 @@ def chat_json(
                 resp = client.chat.completions.create(**kwargs)
                 data = _parse_json(resp.choices[0].message.content or "")
                 actual_model = getattr(resp, "model", None)
+                format_mode = (
+                    fmt["type"] if fmt is not None else "plain_json"
+                )
+                print(
+                    "Astra JSON mode:"
+                    f" format={format_mode},"
+                    f" reasoning_effort={effort or 'none'},"
+                    f" model={actual_model or model}",
+                    flush=True,
+                )
                 return data, str(actual_model) if actual_model else None
             except BadRequestError as e:
                 last_err = e

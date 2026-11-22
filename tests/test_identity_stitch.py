@@ -13,6 +13,30 @@ def box(center_x: float, *, height: float = 40.0) -> np.ndarray:
 
 
 class LocalTrackletStitchTests(unittest.TestCase):
+    def test_stitch_uses_real_frame_timestamps(self) -> None:
+        lp = LocalPass(fps=60.0, width=200, height=100, total=8)
+        lp.frame_times = [
+            0.0,
+            0.05,
+            0.10,
+            0.15,
+            0.20,
+            0.25,
+            0.30,
+            0.35,
+        ]
+        lp.dets = {
+            0: [(1, box(20), 0.9)],
+            1: [(1, box(22), 0.9)],
+            2: [(1, box(24), 0.9)],
+            4: [(2, box(28), 0.9)],
+            5: [(2, box(30), 0.9)],
+        }
+
+        proposals = propose_tracklet_stitches(lp)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertAlmostEqual(proposals[0].gap_s, 0.10)
     def test_proposes_mutual_unambiguous_short_gap(self) -> None:
         lp = LocalPass(fps=10.0, width=200, height=100, total=8)
         lp.dets = {

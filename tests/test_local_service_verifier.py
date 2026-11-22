@@ -91,6 +91,34 @@ def _frames(_source: Path, indexes: tuple[int, ...]) -> dict[int, np.ndarray]:
 
 
 class LocalFeatureTests(unittest.TestCase):
+    def test_contact_duration_uses_real_frame_timestamps(self) -> None:
+        frames = (0, 2, 4, 6, 8)
+        times = np.arange(9, dtype=float) * 0.05
+        times[6] = 0.5
+        times[7] = 0.55
+        times[8] = 0.6
+        staff = {frame: (10.0, 10.0, 30.0, 80.0) for frame in frames}
+        customer = {frame: (60.0, 10.0, 80.0, 80.0) for frame in frames}
+        positive_pose = {frame: [_pose(positive=True)] for frame in frames}
+        objects = {
+            frame: [ObjectDetection((42.0, 62.0, 49.0, 69.0), "cup", 0.9)]
+            for frame in frames
+        }
+
+        features, evidence = extract_local_service_features(
+            _candidate(0.5, start=0, end=8),
+            frames,
+            staff,
+            customer,
+            (40.0, 60.0, 90.0, 90.0),
+            positive_pose,
+            objects,
+            fps=10.0,
+            frame_times=times,
+        )
+
+        self.assertAlmostEqual(features["contact_duration_ratio"], 3.0 / 7.0, places=5)
+        self.assertLess(features["contact_duration_ratio"], 0.5)
     def test_dense_local_sampling_is_joint_and_bounded(self) -> None:
         tracks = _tracks(30)
         tracks["tracks"]["12"]["frames"] = list(range(0, 30, 2))

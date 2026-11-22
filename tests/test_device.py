@@ -5,7 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import cv2
 import numpy as np
 
 from flowmetric.device import resolve_device
@@ -57,21 +56,32 @@ class DeviceResolutionTests(unittest.TestCase):
 
 
 class TrackingDeviceTests(unittest.TestCase):
-    @patch("flowmetric.tracking.local.cv2.VideoCapture")
+    @patch("flowmetric.tracking.local.av.open")
     @patch("flowmetric.tracking.local.YOLO")
     def test_local_tracker_passes_resolved_device_to_ultralytics(
-        self, yolo_class, capture_class
+        self, yolo_class, av_open
     ) -> None:
         frame = np.zeros((8, 12, 3), dtype=np.uint8)
-        capture = capture_class.return_value
-        capture.isOpened.return_value = True
-        capture.get.side_effect = lambda key: {
-            cv2.CAP_PROP_FPS: 24.0,
-            cv2.CAP_PROP_FRAME_WIDTH: 12,
-            cv2.CAP_PROP_FRAME_HEIGHT: 8,
-            cv2.CAP_PROP_FRAME_COUNT: 1,
-        }[key]
-        capture.read.side_effect = [(True, frame), (False, None)]
+
+        decoded_frame = SimpleNamespace(
+            pts=0,
+            time_base=SimpleNamespace(__float__=lambda self: 1 / 24),
+            to_ndarray=lambda format: frame,
+        )
+
+        # PyAV использует Fraction для time_base.
+        from fractions import Fraction
+        decoded_frame.time_base = Fraction(1, 24)
+
+        stream = SimpleNamespace(
+            average_rate=24,
+            codec_context=SimpleNamespace(width=12, height=8),
+            time_base=Fraction(1, 24),
+        )
+        container = av_open.return_value
+        container.streams.video = [stream]
+        container.decode.return_value = iter([decoded_frame])
+
         model = yolo_class.return_value
         model.track.return_value = [SimpleNamespace(boxes=None)]
 
@@ -87,8 +97,7 @@ class TrackingDeviceTests(unittest.TestCase):
 
         self.assertEqual(result.total, 1)
         self.assertEqual(model.track.call_args.kwargs["device"], "mps")
-        capture.release.assert_called_once()
-
+        container.close.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

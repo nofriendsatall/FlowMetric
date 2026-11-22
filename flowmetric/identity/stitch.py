@@ -41,6 +41,7 @@ class _EndpointTrack:
     frames: np.ndarray
     centers: np.ndarray
     heights: np.ndarray
+    times: np.ndarray
 
     @property
     def first_frame(self) -> int:
@@ -53,6 +54,11 @@ class _EndpointTrack:
 
 def _endpoint_tracks(local_pass: LocalPass) -> list[_EndpointTrack]:
     observations: dict[int, list[tuple[int, np.ndarray, float]]] = {}
+    frame_times = (
+        np.asarray(local_pass.frame_times, dtype=float)
+        if len(local_pass.frame_times) == local_pass.total
+        else None
+    )
     for frame, detections in local_pass.dets.items():
         best: dict[int, tuple[np.ndarray, float]] = {}
         for tracklet_id, box, confidence in detections:
@@ -71,6 +77,11 @@ def _endpoint_tracks(local_pass: LocalPass) -> list[_EndpointTrack]:
             _EndpointTrack(
                 tracklet_id=tracklet_id,
                 frames=frames,
+                times=(
+                    frame_times[frames]
+                    if frame_times is not None
+                    else frames.astype(float) / local_pass.fps
+                ),
                 centers=np.c_[
                     (boxes[:, 0] + boxes[:, 2]) / 2,
                     (boxes[:, 1] + boxes[:, 3]) / 2,
@@ -85,18 +96,19 @@ def _end_velocity(track: _EndpointTrack, fps: float) -> np.ndarray:
     """Robust recent velocity in pixels/second."""
     if len(track.frames) < 2:
         return np.zeros(2, dtype=float)
+
     start = max(0, len(track.frames) - 6)
-    frame_deltas = np.diff(track.frames[start:]).astype(float)
-    valid = frame_deltas > 0
+    dt = np.diff(track.times[start:])
+    valid = dt > 0
+
     if not np.any(valid):
         return np.zeros(2, dtype=float)
+
     velocities = (
         np.diff(track.centers[start:], axis=0)[valid]
-        / frame_deltas[valid, None]
-        * fps
+        / dt[valid, None]
     )
     return np.median(velocities, axis=0)
-
 
 def _candidate(
     earlier: _EndpointTrack,
@@ -110,7 +122,10 @@ def _candidate(
     gap_frames = later.first_frame - earlier.last_frame
     if gap_frames <= 0:
         return None
-    gap_s = gap_frames / fps
+
+    gap_s = float(later.times[0] - earlier.times[-1])
+    if gap_s <= 0:
+        return None
     if gap_s > max_gap_s:
         return None
 
@@ -126,7 +141,12 @@ def _candidate(
     # Do not let one jittery endpoint extrapolate farther than one body height
     # during this deliberately short gap.
     speed = float(np.linalg.norm(velocity))
-    max_speed = earlier_height / max(gap_s, 1.0 / fps)
+    min_dt = (
+        float(np.min(np.diff(earlier.times)))
+        if len(earlier.times) > 1
+        else 1.0 / fps
+    )
+    max_speed = earlier_height / max(gap_s, min_dt)
     if speed > max_speed:
         velocity *= max_speed / speed
     predicted = earlier.centers[-1] + velocity * gap_s

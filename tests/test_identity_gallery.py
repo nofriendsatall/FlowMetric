@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -17,6 +18,8 @@ from identity_gallery import (
 )
 from track import LocalPass, sync_ids
 
+
+from flowmetric.identity.appearance import AppearanceStitch
 
 class TrackletGalleryTests(unittest.TestCase):
     def test_targeted_shortlist_ranks_appearance_and_excludes_conflicts(self) -> None:
@@ -243,6 +246,50 @@ class TrackletGalleryTests(unittest.TestCase):
         with self.assertRaisesRegex(AstraResponseError, "more than once"):
             validate_tracklet_reid_response(duplicated, expected_tracklet_ids=[7, 12])
 
+    def test_duplicate_tracklet_assignment_reports_both_identities(self) -> None:
+        response = {
+            "identities": [
+                {
+                    "id": 1,
+                    "role": "customer",
+                    "tracklet_ids": [11544],
+                    "confidence": 0.9,
+                },
+                {
+                    "id": 2,
+                    "role": "staff",
+                    "tracklet_ids": [11544],
+                    "confidence": 0.8,
+                },
+            ],
+            "abstained_tracklet_ids": [],
+        }
+        with self.assertRaisesRegex(
+            AstraResponseError,
+            r"tracklet id 11544 was assigned more than once",
+        ) as ctx:
+            validate_tracklet_reid_response(
+                response, expected_tracklet_ids=[11544]
+            )
+        self.assertIn("identity 1 and identity 2", str(ctx.exception))
+
+    def test_unknown_tracklet_error_includes_expected_inventory(self) -> None:
+        response = {
+            "identities": [{
+                "id": 1,
+                "role": "customer",
+                "tracklet_ids": [29895],
+                "confidence": 0.9,
+            }],
+            "abstained_tracklet_ids": [],
+        }
+        with self.assertRaisesRegex(AstraResponseError, "expected_count=3") as ctx:
+            validate_tracklet_reid_response(
+                response, expected_tracklet_ids=[10, 20, 30]
+            )
+        self.assertIn("expected_head=[10, 20, 30]", str(ctx.exception))
+        self.assertIn("expected_tail=[10, 20, 30]", str(ctx.exception))
+
     def test_normalized_gallery_drives_weighted_merge_and_abstain(self) -> None:
         lp = LocalPass(fps=10.0, width=160, height=100, total=4)
         lp.sample_idx = [0, 1, 2, 3]
@@ -291,6 +338,61 @@ class TrackletGalleryTests(unittest.TestCase):
         mapping, _, stats = sync_ids(lp, [normalized], iou_thr=0.3)
         self.assertNotEqual(mapping[7], mapping[12])
         self.assertTrue(all(item["decision"] == "abstain" for item in stats["identity_decisions"]))
+
+    def test_fallback_tracklets_are_protected_from_appearance_stitch(self) -> None:
+        lp = LocalPass(fps=10.0, width=160, height=100, total=4)
+        lp.sample_idx = [0, 1, 2, 3]
+        box = np.asarray([10, 10, 50, 90], float)
+        lp.dets = {
+            0: [(7, box.copy(), 0.9)],
+            1: [(7, box.copy(), 0.9)],
+            2: [(12, box.copy(), 0.9)],
+            3: [(12, box.copy(), 0.9)],
+        }
+        fallback = normalize_gallery_response(
+            {
+                "identities": [],
+                "abstained_tracklet_ids": [7, 12],
+            },
+            tracklets=[
+                {"tracklet_id": 7, "crop_count": 2},
+                {"tracklet_id": 12, "crop_count": 2},
+            ],
+            video_frames=lp.sample_idx,
+            detections=lp.dets,
+            original_width=lp.width,
+            original_height=lp.height,
+            requested_model="requested",
+            actual_model="actual",
+        )
+        fallback["_meta"]["astra_batch_fallback"] = True
+        fallback["_meta"]["fallback_abstained_tracklet_ids"] = [7, 12]
+
+        proposal = AppearanceStitch(
+            earlier_id=7,
+            later_id=12,
+            gap_s=0.1,
+            endpoint_distance=0.1,
+            height_ratio=1.0,
+            similarity=0.99,
+            score=0.01,
+        )
+        with patch(
+            "flowmetric.identity.sync.propose_appearance_stitches",
+            return_value=[proposal],
+        ):
+            mapping, _, stats = sync_ids(
+                lp,
+                [fallback],
+                iou_thr=0.3,
+                appearance_stitch=True,
+            )
+
+        self.assertNotEqual(mapping[7], mapping[12])
+        self.assertEqual(stats["appearance_stitch_merges"], 0)
+        decision = stats["appearance_stitch_decisions"][0]
+        self.assertEqual(decision["decision"], "reject")
+        self.assertEqual(decision["reason"], "astra_batch_fallback_protected")
 
     def test_sync_reports_late_revision_of_weak_identity_merge(self) -> None:
         lp = LocalPass(fps=10.0, width=160, height=100, total=4)
@@ -401,6 +503,79 @@ class TrackletGalleryTests(unittest.TestCase):
             requested_model="requested",
             actual_model="actual",
         )
+        targeted = normalize_gallery_response(
+            {
+                "identities": [
+                    {
+                        "id": 20,
+                        "role": "customer",
+                        "tracklet_ids": [7, 12],
+                        "confidence": 0.9,
+                    }
+                ],
+                "abstained_tracklet_ids": [],
+            },
+            tracklets=[
+                {"tracklet_id": 7, "crop_count": 2},
+                {"tracklet_id": 12, "crop_count": 2},
+            ],
+            video_frames=lp.sample_idx,
+            detections=lp.dets,
+            original_width=lp.width,
+            original_height=lp.height,
+            requested_model="requested",
+            actual_model="actual",
+            gallery_scope="targeted",
+            targeted_query_ids=[12],
+            targeted_candidate_shortlists={12: [7]},
+        )
+
+        mapping, _, stats = sync_ids(lp, [base, targeted], iou_thr=0.3)
+
+        self.assertEqual(mapping[7], mapping[12])
+        self.assertEqual(stats["targeted_batches"], 1)
+        self.assertEqual(stats["targeted_query_tracklets"], 1)
+        self.assertEqual(stats["targeted_shortlist_queries"], 1)
+        self.assertEqual(stats["targeted_shortlist_options"], 1)
+
+
+    def test_targeted_gallery_can_attach_fallback_tracklet_to_reference(self) -> None:
+        lp = LocalPass(fps=10.0, width=160, height=100, total=4)
+        lp.sample_idx = [0, 1, 2, 3]
+        first_box = np.asarray([10, 10, 50, 90], float)
+        second_box = np.asarray([12, 10, 52, 90], float)
+        lp.dets = {
+            0: [(7, first_box.copy(), 0.9)],
+            1: [(7, first_box.copy(), 0.9)],
+            2: [(12, second_box.copy(), 0.9)],
+            3: [(12, second_box.copy(), 0.9)],
+        }
+        base = normalize_gallery_response(
+            {
+                "identities": [
+                    {
+                        "id": 1,
+                        "role": "customer",
+                        "tracklet_ids": [7],
+                        "confidence": 0.9,
+                    }
+                ],
+                "abstained_tracklet_ids": [12],
+            },
+            tracklets=[
+                {"tracklet_id": 7, "crop_count": 2},
+                {"tracklet_id": 12, "crop_count": 2},
+            ],
+            video_frames=lp.sample_idx,
+            detections=lp.dets,
+            original_width=lp.width,
+            original_height=lp.height,
+            requested_model="requested",
+            actual_model="actual",
+        )
+        base["_meta"]["astra_batch_fallback"] = True
+        base["_meta"]["fallback_abstained_tracklet_ids"] = [12]
+
         targeted = normalize_gallery_response(
             {
                 "identities": [

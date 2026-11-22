@@ -11,6 +11,7 @@ import numpy as np
 TRACK_SMOOTH_SECONDS = 0.5
 
 
+
 @dataclass
 class Track:
     gid: str
@@ -18,14 +19,32 @@ class Track:
     frames: np.ndarray
     boxes: np.ndarray
     fps: float
+    frame_times: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        self.frames = np.asarray(self.frames, dtype=int)
+        self.boxes = np.asarray(self.boxes, dtype=float)
+
+        if self.frame_times is not None:
+            self.frame_times = np.asarray(self.frame_times, dtype=float)
+            if len(self.frame_times) != len(self.frames):
+                raise ValueError("frame_times and frames must have equal lengths")
+            if len(self.frame_times) > 1 and np.any(np.diff(self.frame_times) <= 0):
+                raise ValueError("frame_times must be strictly increasing")
+
+    @property
+    def times(self) -> np.ndarray:
+        if self.frame_times is not None:
+            return self.frame_times
+        return self.frames / self.fps
 
     @property
     def t0(self) -> float:
-        return self.frames[0] / self.fps
+        return float(self.times[0])
 
     @property
     def t1(self) -> float:
-        return self.frames[-1] / self.fps
+        return float(self.times[-1])
 
     @property
     def life(self) -> float:
@@ -58,50 +77,35 @@ class Track:
 
     def path(self) -> float:
         """Total smoothed path length in body heights."""
-        return float(np.sum(self.speed()[1:] * np.diff(self.frames) / self.fps))
-
+        return float(np.sum(self.speed()[1:] * np.diff(self.times)))
     def speed(self) -> np.ndarray:
         """Smoothed center speed in body heights per second."""
         centers = self.centers
+        times = self.times
+        heights = self.heights
+
         if len(centers) < 2:
             return np.zeros(len(centers))
-        kernel_size = max(1, int(TRACK_SMOOTH_SECONDS * self.fps))
-        kernel = np.ones(kernel_size) / kernel_size
-        smoothed = np.c_[
-            np.convolve(
-                np.pad(
-                    centers[:, 0],
-                    (kernel_size // 2, kernel_size - 1 - kernel_size // 2),
-                    mode="edge",
-                ),
-                kernel,
-                "valid",
-            ),
-            np.convolve(
-                np.pad(
-                    centers[:, 1],
-                    (kernel_size // 2, kernel_size - 1 - kernel_size // 2),
-                    mode="edge",
-                ),
-                kernel,
-                "valid",
-            ),
-        ]
-        dt = np.diff(self.frames) / self.fps
-        velocity = np.linalg.norm(np.diff(smoothed, axis=0), axis=1) / np.maximum(
-            dt, 1e-6
-        )
-        heights = np.convolve(
-            np.pad(
-                self.heights,
-                (kernel_size // 2, kernel_size - 1 - kernel_size // 2),
-                mode="edge",
-            ),
-            kernel,
-            "valid",
-        )
-        return np.r_[velocity[0], velocity] / np.maximum(heights, 1.0)
 
+        half_window = TRACK_SMOOTH_SECONDS / 2.0
+        smoothed = np.empty_like(centers)
+        smoothed_heights = np.empty_like(heights)
+
+        for i, t in enumerate(times):
+            mask = np.abs(times - t) <= half_window
+            smoothed[i] = np.mean(centers[mask], axis=0)
+            smoothed_heights[i] = np.mean(heights[mask])
+
+        dt = np.diff(times)
+        velocity = (
+            np.linalg.norm(np.diff(smoothed, axis=0), axis=1)
+            / np.maximum(dt, 1e-6)
+        )
+
+        return np.r_[
+            0.0,
+            velocity / np.maximum(smoothed_heights[1:], 1.0),
+        ]
 
 @dataclass(frozen=True)
 class ServiceInterval:
@@ -122,8 +126,6 @@ class ServiceCandidate:
 
     interval: ServiceInterval
     table_box: tuple[float, float, float, float] | None
-
-
 @dataclass(frozen=True)
 class ServiceDecision:
     """A verifier verdict without authority to change IDs or boundaries."""

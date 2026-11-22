@@ -125,7 +125,7 @@ def run_context_reranker_shadow(
             float(np.mean([item[2] for item in right_samples])),
         )
         minimum_support = min(len(left_samples), len(right_samples)) / 8.0
-        gap_s = (later.first_frame - earlier.last_frame) / local_pass.fps
+        gap_s = later.first_time - earlier.last_time
         scale = max((earlier.last_height + later.first_height) / 2, 1.0)
         displacement = later.first_foot - earlier.last_foot
         endpoint_distance = float(np.linalg.norm(displacement) / scale)

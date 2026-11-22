@@ -39,6 +39,31 @@ class MotionBridgeTests(unittest.TestCase):
         self.assertEqual((proposals[0].earlier_id, proposals[0].later_id), (1, 2))
         self.assertGreater(proposals[0].appearance_similarity, 0.99)
 
+    def test_motion_bridge_uses_real_frame_timestamps(self) -> None:
+        lp = LocalPass(fps=10.0, width=200, height=100, total=30)
+        lp.dets = {
+            0: [(1, box(20), 0.9)],
+            1: [(1, box(22), 0.9)],
+            2: [(1, box(24), 0.9)],
+            8: [(2, box(36), 0.9)],
+            9: [(2, box(38), 0.9)],
+            10: [(2, box(40), 0.9)],
+        }
+        lp.appearance_embeddings = {
+            1: samples((1.0, 0.0)),
+            2: samples((0.99, 0.01)),
+        }
+        lp.frame_times = [
+            0.00, 0.10, 0.20, 0.25, 0.32,
+            0.40, 0.48, 0.55, 0.60, 0.70,
+            0.80,
+        ] + [0.90 + i * 0.10 for i in range(19)]
+
+        proposals = propose_motion_bridges(lp)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertAlmostEqual(proposals[0].gap_s, 0.40, places=6)
+
     def test_rejects_motion_match_without_appearance_confirmation(self) -> None:
         lp = LocalPass(fps=10.0, width=200, height=100, total=30)
         lp.dets = {

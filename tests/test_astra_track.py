@@ -6,9 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import httpx
+from openai import BadRequestError
 
 import numpy as np
+
+from flowmetric.infrastructure.astra import chat_json
 
 from astra import (
     AstraCacheError,
@@ -277,6 +282,319 @@ class AstraResponseValidationTests(unittest.TestCase):
         )
         frame_loader.assert_called_once_with(Path("video.mp4"), (4,))
 
+
+    def test_astra_pass_skips_targeted_result_after_two_invalid_responses(self) -> None:
+        lp = LocalPass(fps=10.0, width=160, height=100, total=5)
+        lp.sample_idx = [0, 1, 2, 3]
+        lp.sample_frames = [np.full((100, 160, 3), 80, np.uint8) for _ in range(4)]
+        left = np.asarray([10, 10, 50, 90], float)
+        right = np.asarray([12, 10, 52, 90], float)
+        lp.dets = {
+            0: [(7, left.copy(), 0.9)],
+            1: [(7, left.copy(), 0.9)],
+            2: [(12, right.copy(), 0.9)],
+            3: [(12, right.copy(), 0.9)],
+            4: [(12, right.copy(), 0.95)],
+        }
+        base_response = {
+            "identities": [
+                {
+                    "id": 1,
+                    "role": "customer",
+                    "tracklet_ids": [7],
+                    "confidence": 0.9,
+                }
+            ],
+            "abstained_tracklet_ids": [12],
+        }
+        targeted_response = {
+            "identities": [
+                {
+                    "id": 20,
+                    "role": "customer",
+                    "tracklet_ids": [7, 12],
+                    "confidence": 0.9,
+                }
+            ],
+            "abstained_tracklet_ids": [],
+        }
+
+        with (
+            patch(
+                "flowmetric.infrastructure.astra.make_client",
+                return_value=(SimpleNamespace(base_url="mock"), "mock-model"),
+            ),
+            patch(
+                "flowmetric.identity.gallery.astra_reid_tracklet_gallery",
+                side_effect=[
+                    (base_response, "mock-model"),
+                    AstraResponseError("invalid targeted response"),
+                    AstraResponseError("invalid targeted response after retry"),
+                ],
+            ) as gallery_call,
+            patch(
+                "flowmetric.media.video.load_video_frames",
+                return_value={4: np.full((100, 160, 3), 100, np.uint8)},
+            ) as frame_loader,
+        ):
+            reids = astra_pass(
+                lp,
+                source=Path("video.mp4"),
+                model="mock-model",
+                effort="low",
+                batch_size=16,
+                batch_overlap=4,
+                workers=1,
+                targeted_pass=True,
+                merge_confidence=0.55,
+                min_support=2,
+                targeted_resampling=True,
+                targeted_resample_budget=4,
+                targeted_shortlist=True,
+                targeted_shortlist_size=3,
+            )
+
+        self.assertEqual(len(reids), 1)
+        self.assertNotEqual(reids[0]["_meta"].get("gallery_scope"), "targeted")
+        self.assertEqual(gallery_call.call_count, 3)
+        self.assertEqual(
+            gallery_call.call_args_list[1].kwargs["target_tracklet_ids"], [12]
+        )
+        self.assertEqual(
+            gallery_call.call_args_list[2].kwargs["target_tracklet_ids"], [12]
+        )
+        frame_loader.assert_called_once_with(Path("video.mp4"), (4,))
+
+    def test_targeted_gallery_uses_streaming_reader_without_retaining_frames(self) -> None:
+        lp = LocalPass(fps=10.0, width=160, height=100, total=4)
+        lp.sample_idx = [0, 1, 2, 3]
+        lp.sample_frames = []
+        left = np.asarray([10, 10, 50, 90], float)
+        right = np.asarray([12, 10, 52, 90], float)
+        lp.dets = {
+            0: [(7, left.copy(), 0.9)],
+            1: [(7, left.copy(), 0.9)],
+            2: [(12, right.copy(), 0.9)],
+            3: [(12, right.copy(), 0.9)],
+        }
+
+        base_response = {
+            "identities": [
+                {
+                    "id": 1,
+                    "role": "customer",
+                    "tracklet_ids": [7],
+                    "confidence": 0.9,
+                }
+            ],
+            "abstained_tracklet_ids": [12],
+        }
+        targeted_response = {
+            "identities": [
+                {
+                    "id": 20,
+                    "role": "customer",
+                    "tracklet_ids": [7, 12],
+                    "confidence": 0.9,
+                }
+            ],
+            "abstained_tracklet_ids": [],
+        }
+
+        class FakeReader:
+            def __init__(self):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read_many(self, indexes):
+                indexes = tuple(indexes)
+                self.calls.append(indexes)
+                return {
+                    index: np.full((100, 160, 3), index, np.uint8)
+                    for index in indexes
+                }
+
+        readers = [FakeReader(), FakeReader()]
+        gallery_items = []
+
+        def build_streaming_gallery(items, detections):
+            consumed = list(items)
+            gallery_items.extend(
+                (sample_index, frame_index, int(frame[0, 0, 0]))
+                for sample_index, frame, frame_index in consumed
+            )
+            return np.zeros((240, 176, 3), np.uint8), [
+                {"tracklet_id": 7, "crop_count": 1},
+                {"tracklet_id": 12, "crop_count": 1},
+            ]
+
+        with (
+            patch(
+                "flowmetric.infrastructure.astra.make_client",
+                return_value=(SimpleNamespace(base_url="mock"), "mock-model"),
+            ),
+            patch(
+                "flowmetric.infrastructure.astra.validate_reid_batches"
+            ),
+            patch(
+                "flowmetric.pipeline.validate_reids_against_local"
+            ),
+            patch(
+                "flowmetric.identity.gallery.normalize_gallery_response",
+                side_effect=[
+                    {**base_response, "_meta": {}},
+                    {**targeted_response, "_meta": {"gallery_scope": "targeted"}},
+                ],
+            ),
+            patch(
+                "flowmetric.media.video.VideoFrameReader",
+                side_effect=readers,
+            ) as reader_factory,
+            patch(
+                "flowmetric.identity.gallery.build_tracklet_gallery",
+                return_value=(np.zeros((240, 176, 3), np.uint8), []),
+            ),
+            patch(
+                "flowmetric.identity.gallery.build_tracklet_gallery_from_iterable",
+                side_effect=build_streaming_gallery,
+            ) as streaming_gallery,
+            patch(
+                "flowmetric.identity.gallery.targeted_gallery_inventory",
+                return_value=([12], [7]),
+            ),
+            patch(
+                "flowmetric.identity.gallery.astra_reid_tracklet_gallery",
+                side_effect=[
+                    (base_response, "mock-model"),
+                    (targeted_response, "mock-model"),
+                ],
+            ),
+        ):
+            reids = astra_pass(
+                lp,
+                source=Path("video.mp4"),
+                model="mock-model",
+                effort="low",
+                batch_size=16,
+                batch_overlap=4,
+                workers=1,
+                targeted_pass=True,
+                merge_confidence=0.55,
+                min_support=2,
+            )
+
+        self.assertEqual(reader_factory.call_count, 2)
+        self.assertEqual(readers[0].calls, [(0, 1, 2, 3)])
+        self.assertEqual(readers[1].calls, [(0,), (1,), (2,), (3,)])
+        self.assertEqual(
+            gallery_items,
+            [(0, 0, 0), (1, 1, 1), (2, 2, 2), (3, 3, 3)],
+        )
+        streaming_gallery.assert_called_once()
+        self.assertEqual(len(reids), 2)
+        self.assertEqual(reids[1]["_meta"]["gallery_scope"], "targeted")
+        self.assertEqual(lp.sample_frames, [])
+
+    def test_astra_streaming_decodes_bounded_batches_and_reuses_overlap(self) -> None:
+        lp = LocalPass(fps=10.0, width=160, height=100, total=4)
+        lp.sample_idx = [0, 1, 2, 3]
+        lp.sample_frames = []
+        box = np.asarray([10, 10, 50, 90], float)
+        lp.dets = {
+            frame: [(7, box.copy(), 0.9)]
+            for frame in lp.sample_idx
+        }
+
+        class FakeReader:
+            def __init__(self):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read_many(self, indexes):
+                indexes = tuple(indexes)
+                self.calls.append(indexes)
+                return {
+                    index: np.full((100, 160, 3), index, np.uint8)
+                    for index in indexes
+                }
+
+        reader = FakeReader()
+        gallery_frames = []
+
+        def build_gallery(frames, video_frames, detections):
+            gallery_frames.append(
+                (list(video_frames), [int(frame[0, 0, 0]) for frame in frames])
+            )
+            return [], []
+
+        with (
+            patch(
+                "flowmetric.infrastructure.astra.make_client",
+                return_value=(SimpleNamespace(base_url="mock"), "mock-model"),
+            ),
+            patch(
+                "flowmetric.infrastructure.astra.validate_reid_batches"
+            ),
+            patch(
+                "flowmetric.pipeline.validate_reids_against_local"
+            ),
+            patch(
+                "flowmetric.media.video.VideoFrameReader",
+                return_value=reader,
+            ),
+            patch(
+                "flowmetric.identity.gallery.build_tracklet_gallery",
+                side_effect=build_gallery,
+            ),
+            patch(
+                "flowmetric.identity.gallery.astra_reid_tracklet_gallery",
+                return_value=({}, "mock-model"),
+            ),
+            patch(
+                "flowmetric.identity.gallery.normalize_gallery_response",
+                side_effect=lambda response, **kwargs: {
+                    "video_frames": kwargs["video_frames"]
+                },
+            ),
+        ):
+            reids = astra_pass(
+                lp,
+                source=Path("video.mp4"),
+                model="mock-model",
+                effort="low",
+                batch_size=2,
+                batch_overlap=1,
+                workers=2,
+                targeted_pass=False,
+                merge_confidence=0.55,
+                min_support=2,
+            )
+
+        self.assertEqual(reader.calls, [(0, 1, 2), (3,)])
+        self.assertEqual(
+            gallery_frames,
+            [
+                ([0, 1], [0, 1]),
+                ([1, 2], [1, 2]),
+                ([2, 3], [2, 3]),
+            ],
+        )
+        self.assertEqual(
+            [item["video_frames"] for item in reids],
+            [[0, 1], [1, 2], [2, 3]],
+        )
+        self.assertEqual(lp.sample_frames, [])
+
     def test_valid_box_is_clipped_to_image(self) -> None:
         response = _response([0, 10])
         response["people"][0]["detections"][0]["xyxy"] = [-5, -4, 250, 90]
@@ -376,6 +694,123 @@ class AstraResponseValidationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AstraResponseError, "no detections"):
             validate_reids_against_local(lp, [response])
+
+
+
+class AstraChatJsonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        }
+        self.success = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"ok": true}')
+                )
+            ],
+            model="mock-model",
+        )
+
+    def _bad_request(self) -> BadRequestError:
+        request = httpx.Request("POST", "https://example.test")
+        response = httpx.Response(400, request=request)
+        return BadRequestError(
+            "response format unsupported",
+            response=response,
+            body={"error": "unsupported"},
+        )
+
+    def _client(self, side_effect):
+        create = Mock(side_effect=side_effect)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create)
+            )
+        )
+        return client, create
+
+    def test_strict_json_schema_is_used_when_accepted(self) -> None:
+        client, create = self._client([self.success])
+
+        data, model = chat_json(
+            client,
+            model="mock-model",
+            messages=[],
+            reasoning_effort=None,
+            schema=self.schema,
+            schema_name="test_schema",
+        )
+
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(model, "mock-model")
+        create.assert_called_once()
+        fmt = create.call_args.kwargs["response_format"]
+        self.assertEqual(fmt["type"], "json_schema")
+        self.assertTrue(fmt["json_schema"]["strict"])
+        self.assertEqual(fmt["json_schema"]["schema"], self.schema)
+
+    def test_json_object_fallback_after_schema_rejection(self) -> None:
+        client, create = self._client([
+            self._bad_request(),
+            self.success,
+        ])
+
+        data, _ = chat_json(
+            client,
+            model="mock-model",
+            messages=[],
+            reasoning_effort=None,
+            schema=self.schema,
+            schema_name="test_schema",
+        )
+
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(create.call_count, 2)
+        calls = create.call_args_list
+        self.assertEqual(
+            calls[0].kwargs["response_format"]["type"],
+            "json_schema",
+        )
+        self.assertEqual(
+            calls[1].kwargs["response_format"]["type"],
+            "json_object",
+        )
+        self.assertEqual(
+            self.schema["properties"]["ok"]["type"],
+            "boolean",
+        )
+
+    def test_plain_json_fallback_after_both_formats_are_rejected(self) -> None:
+        client, create = self._client([
+            self._bad_request(),
+            self._bad_request(),
+            self.success,
+        ])
+
+        data, _ = chat_json(
+            client,
+            model="mock-model",
+            messages=[],
+            reasoning_effort=None,
+            schema=self.schema,
+            schema_name="test_schema",
+        )
+
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(create.call_count, 3)
+        calls = create.call_args_list
+        self.assertEqual(
+            calls[0].kwargs["response_format"]["type"],
+            "json_schema",
+        )
+        self.assertEqual(
+            calls[1].kwargs["response_format"]["type"],
+            "json_object",
+        )
+        self.assertNotIn("response_format", calls[2].kwargs)
 
 
 class AstraScalingTests(unittest.TestCase):

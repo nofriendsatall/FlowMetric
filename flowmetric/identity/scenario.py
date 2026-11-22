@@ -16,6 +16,8 @@ class TrackletLifecycle:
     tracklet_id: int
     first_frame: int
     last_frame: int
+    first_time: float
+    last_time: float
     first_foot: np.ndarray
     last_foot: np.ndarray
     first_height: float
@@ -103,20 +105,32 @@ def _boundary(
     return None
 
 
-def _velocity(items: list[tuple[int, np.ndarray]], fps: float, height: float) -> np.ndarray:
+def _velocity(
+    items: list[tuple[int, np.ndarray]],
+    frame_times: np.ndarray,
+    fps: float,
+    height: float,
+) -> np.ndarray:
     recent = items[-4:]
     if len(recent) < 2:
         return np.zeros(2, dtype=float)
-    frame_delta = recent[-1][0] - recent[0][0]
-    if frame_delta <= 0:
-        return np.zeros(2, dtype=float)
-    return (
-        (_foot(recent[-1][1]) - _foot(recent[0][1]))
-        * fps
-        / frame_delta
-        / max(height, 1.0)
-    )
 
+    first_frame = recent[0][0]
+    last_frame = recent[-1][0]
+
+    if (
+        first_frame < 0
+        or last_frame >= len(frame_times)
+        or fps <= 0
+    ):
+        return np.zeros(2, dtype=float)
+
+    elapsed = float(frame_times[last_frame] - frame_times[first_frame])
+    if elapsed <= 0:
+        return np.zeros(2, dtype=float)
+
+    displacement = _foot(recent[-1][1]) - _foot(recent[0][1])
+    return displacement / elapsed / max(height, 1.0)
 
 def build_tracklet_lifecycles(
     local_pass: LocalPass,
@@ -124,6 +138,15 @@ def build_tracklet_lifecycles(
 ) -> dict[int, TrackletLifecycle]:
     """Summarize endpoints, zones and exit state for every local tracklet."""
     margin = float(scene.get("edge_margin", 0.06))
+    frame_times = np.asarray(local_pass.frame_times, dtype=float)
+    if (
+        frame_times.shape != (local_pass.total,)
+        or not np.isfinite(frame_times).all()
+        or (len(frame_times) > 1 and np.any(np.diff(frame_times) <= 0))
+    ):
+        if local_pass.fps <= 0:
+            raise ValueError("LocalPass fps must be positive when frame timestamps are unavailable")
+        frame_times = np.arange(local_pass.total, dtype=float) / local_pass.fps
     observations: dict[int, dict[int, tuple[np.ndarray, float]]] = {}
     for frame, detections in local_pass.dets.items():
         for tracklet_id, box, confidence in detections:
@@ -154,7 +177,9 @@ def build_tracklet_lifecycles(
             margin=margin,
             scene=scene,
         )
-        velocity = _velocity(items, local_pass.fps, last_height)
+        first_time = float(frame_times[first_frame])
+        last_time = float(frame_times[last_frame])
+        velocity = _velocity(items, frame_times, local_pass.fps, last_height)
         outward = False
         if last_boundary == "left":
             outward = velocity[0] < -0.15
@@ -171,6 +196,8 @@ def build_tracklet_lifecycles(
             tracklet_id=tracklet_id,
             first_frame=first_frame,
             last_frame=last_frame,
+            first_time=first_time,
+            last_time=last_time,
             first_foot=first_foot,
             last_foot=last_foot,
             first_height=first_height,
@@ -201,7 +228,9 @@ def assess_scenario_link(
     if gap_frames <= 0:
         return ScenarioAssessment(True, None, (), 0.0, None, None, None)
 
-    gap_s = gap_frames / fps
+    gap_s = later.first_time - earlier.last_time
+    if gap_s <= 0:
+        return ScenarioAssessment(True, None, (), 0.0, None, None, None)
     scale = max((earlier.last_height + later.first_height) / 2, 1.0)
     displacement = later.first_foot - earlier.last_foot
     endpoint_distance = float(np.linalg.norm(displacement) / scale)

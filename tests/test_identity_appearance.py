@@ -6,6 +6,10 @@ from unittest.mock import patch
 
 import numpy as np
 
+from flowmetric.identity.scenario import (
+    assess_scenario_link,
+    build_tracklet_lifecycles,
+)
 from flowmetric.identity.appearance import (
     AppearanceStitch,
     TrackerAppearanceEncoder,
@@ -60,6 +64,31 @@ def _local_pass() -> LocalPass:
 
 
 class AppearanceStitchTests(unittest.TestCase):
+    def test_scenario_uses_real_vfr_timestamps(self) -> None:
+        lp = LocalPass(fps=60.0, width=200, height=120, total=8)
+        lp.frame_times = [
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.8, 0.9, 1.0
+        ]
+        lp.dets = {
+            0: [(1, np.asarray([10, 10, 30, 50], float), 0.9)],
+            2: [(1, np.asarray([20, 10, 40, 50], float), 0.9)],
+            6: [(2, np.asarray([30, 10, 50, 50], float), 0.9)],
+            7: [(2, np.asarray([32, 10, 52, 50], float), 0.9)],
+        }
+
+        lifecycles = build_tracklet_lifecycles(lp, {"edge_margin": 0.06})
+
+        self.assertAlmostEqual(lifecycles[1].first_time, 0.0)
+        self.assertAlmostEqual(lifecycles[1].last_time, 0.2)
+        self.assertAlmostEqual(
+            float(np.linalg.norm(lifecycles[1].end_velocity)),
+            1.25,
+        )
+
+        assessment = assess_scenario_link(
+            1, 2, lifecycles=lifecycles, fps=lp.fps
+        )
+        self.assertAlmostEqual(assessment.gap_s, 0.7)
     def test_masked_clothing_descriptor_ignores_background_pixels(self) -> None:
         crop = np.zeros((100, 60, 3), dtype=np.uint8)
         crop[10:55, 15:45] = (0, 0, 255)

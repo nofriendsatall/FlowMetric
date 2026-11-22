@@ -1,4 +1,5 @@
 import json
+import errno
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,7 +30,7 @@ class ViewerSessionTest(unittest.TestCase):
     def test_server_falls_forward_when_preferred_port_is_busy(self):
         handler = Mock()
         fallback = Mock(server_port=8766)
-        busy = OSError(48, "Address already in use")
+        busy = OSError(errno.EADDRINUSE, "Address already in use")
         with patch(
             "viewer.server.ThreadingHTTPServer", side_effect=[busy, fallback]
         ) as server_class:
